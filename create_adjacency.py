@@ -38,11 +38,17 @@ for i in range(len(data)-1):
         continue
     key = stop1[1] + "_" + stop2[1] if int(stop1[1]) < int(stop2[1]) else stop2[1] + "_" + stop1[1]
     if key not in adjacency:
-        adjacency[key] = []
-    if stop1[0] not in adjacency[key]:
-        adjacency[key].append(stop1[0])
+        adjacency[key] = [[], []]
+    if stop1[0] not in adjacency[key][0]:
+        adjacency[key][0].append(stop1[0])
+    # seems inefficient
+    cur.execute("SELECT route_id FROM " + schema_name + ".trips WHERE trip_id='" + stop1[0] + "';")
+    route_id = cur.fetchall()[0][0]
+    if route_id not in adjacency[key][1]:
+        adjacency[key][1].append(route_id) #ASK IF MULTIPLE ROUTES POSSIBLE
 
-cur.execute("CREATE TABLE " + schema_name + ".stop_adjacency (stop_id_1 varchar(255), stop_id_2 varchar(255), trip_ids varchar(255)[]);")
+cur.execute("CREATE TABLE " + schema_name + ".stop_adjacency (stop_id_1 varchar(255), stop_id_2 varchar(255), trip_ids varchar(255)[]), route_ids varchar(255)[];")
+
 
 # cur.execute("INSERT INTO " + schema_name + ".stop_adjacency (stop_id_1, stop_id_2, route_ids) VALUES (%s, %s, '{\"ASDF\"}');", ("asdf", "asdf"))
 insert_values = ",".join(cur.mogrify("(%s, %s, %s)", (k.split("_")[0], k.split("_")[1], "{" + ", ".join(adjacency[k]) + "}")) for k in adjacency.keys())
