@@ -26,6 +26,7 @@ get_stop_times_query = "SELECT trip_id, stop_id, stop_sequence FROM " + schema_n
 cur.execute(get_stop_times_query)
 data = cur.fetchall()
 # pprint.pprint(data[:10])
+
 # {
 #     "lower_stop_id_higher_stopid": [route ids]
 # }
@@ -47,13 +48,13 @@ for i in range(len(data)-1):
     if route_id not in adjacency[key][1]:
         adjacency[key][1].append(route_id) #ASK IF MULTIPLE ROUTES POSSIBLE
 
-cur.execute("CREATE TABLE " + schema_name + ".stop_adjacency (stop_id_1 varchar(255), stop_id_2 varchar(255), trip_ids varchar(255)[]), route_ids varchar(255)[];")
+cur.execute("CREATE TABLE " + schema_name + ".stop_adjacency (stop_id_1 varchar(255), stop_id_2 varchar(255), trip_ids varchar(255)[], route_ids varchar(255)[]);")
 
 
 # cur.execute("INSERT INTO " + schema_name + ".stop_adjacency (stop_id_1, stop_id_2, route_ids) VALUES (%s, %s, '{\"ASDF\"}');", ("asdf", "asdf"))
-insert_values = ",".join(cur.mogrify("(%s, %s, %s)", (k.split("_")[0], k.split("_")[1], "{" + ", ".join(adjacency[k]) + "}")) for k in adjacency.keys())
+insert_values = ",".join(cur.mogrify("(%s, %s, %s, %s)", (k.split("_")[0], k.split("_")[1], "{" + ", ".join(adjacency[k][0]) + "}", "{" + ", ".join(adjacency[k][1]) + "}")) for k in adjacency.keys())
 # print insert_values
-cur.execute("INSERT INTO " + schema_name + ".stop_adjacency (stop_id_1, stop_id_2, trip_ids) VALUES " + insert_values)
+cur.execute("INSERT INTO " + schema_name + ".stop_adjacency (stop_id_1, stop_id_2, trip_ids, route_ids) VALUES " + insert_values)
 conn.commit()
 cur.close()
 conn.close()
