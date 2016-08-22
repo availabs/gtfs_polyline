@@ -1,0 +1,22 @@
+{
+  "name": "gtfs_polyline",
+  "version": "1.0.0",
+  "description": "",
+  "main": "handleGeos.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/availabs/gtfs_polyline.git"
+  },
+  "author": "Alan Dai",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/availabs/gtfs_polyline/issues"
+  },
+  "homepage": "https://github.com/availabs/gtfs_polyline#readme",
+  "dependencies": {
+    "pg": "^6.1.0"
+  }
+}
