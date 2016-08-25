@@ -33,33 +33,64 @@ var config = {
 }
 
 var client = new Client(config);
-client.on('drain', client.end.bind(client)); //disconnect client when all queries are finished
+// client.on('drain', client.end.bind(client)); //disconnect client when all queries are finished
 client.connect();
 
-/*var pool = new Pool({
-  host: "169.226.142.154",
-  user: "postgres",
-  password: "transit",
-  database:"gtfs",
-  max: 10, // max number of clients in pool
-  idleTimeoutMillis: 1000, // close & remove clients which have been idle > 1 second
-});
+var adjacencies = [],
+    allGeos = {};
 
-pool.on("error", function(e, client) {
-  console.log("error", e, client);
-});*/
-
-var testQuery = `SELECT trip_id, stop_id, stop_sequence FROM ${schema_name}.stop_times ORDER BY trip_id, stop_sequence`;
-console.log(testQuery);
-// pool.query
-var query = client.query(testQuery, (err, result) => {
+var getAdjacenciesQuery = `SELECT id, route_ids from ${schema_name}.stop_adjacency ORDER BY id`;
+client.query(getAdjacenciesQuery, (err, result) => {
     if(err) {
         console.error(err);
         process.exit();
     }
 
+    console.log(result.rows[0].route_ids); // [ '289-142', '280-142', '286-142' ]
+    adjacencies = result.rows;
+    // console.log(adjacencies);
+    gatherGeos(adjacencies, function(){});
+});
 
-})
+var gatherGeos = function(data, cb) {
+    data.forEach((val, i) => {
+        let route_ids = val.route_ids,
+            toMeshGeos = {},
+            getGeoQuery = `SELECT ST_AsGeoJSON(geom) as route_shape, route_id FROM ${schema_name}.routes;`;
+
+        client.query(getGeoQuery, (err, result) => {
+            if(err) {
+                console.error(err);
+                process.exit();
+            }
+            console.log(result);
+            let combinedGeos = {};
+            result.rows.forEach((routeGeo, rgi) => {
+
+            });
+            client.end(function (err) {
+                if (err) throw err;
+            });
+        });
+        /*route_ids.forEach((route_id) => {
+            if(allGeos[route_id]) {
+                toMeshGeos[route_id] = allGeos[route_id];
+            }
+            else {
+                let getGeoQuery = `SELECT ST_AsGeoJSON(geom) as route_shape FROM ${schema_name}.routes WHERE route_id='${route_id}';`;
+                console.log(getGeoQuery);
+                client.query(getGeoQuery, (err, result) => {
+                    if(err) { console.error(err); }
+                    console.log(result);
+                    process.exit();
+                })
+            }
+        });*/
+    });
+
+    cb();
+}
+
 
 /*
 pool.query(sql)
