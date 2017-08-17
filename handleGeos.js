@@ -1,6 +1,17 @@
-"use strict"
+"use strict";
 
 var Client = require("pg").Client;
+var topojson = require("topojson");
+var async = require("async");
+var turf = require("turf");
+var _ = require("lodash");
+var fs = require("fs");
+var nm = require('node-monkey')();
+nm.attachConsole();
+var config = {
+    indexedSpatialDataFilePath: "/Users/admin/code/gtfs_polyline/mappedRoutes.json",
+    cb: function() {}
+}
 /*var Promise = require("bluebird");
 var utils = require("./utils")
 var jf = Promise.promisifyAll(require("jsonfile"));*/
@@ -24,7 +35,7 @@ var PORT = "5432";
 var PASSWORD = process.env.GTFS_PASSWORD;
 var schema_name = process.argv[2];
 
-var config = {
+var dbConfig = {
     host: HOST,
     user: USER_NAME,
     password: PASSWORD,
@@ -32,27 +43,384 @@ var config = {
     port: PORT
 }
 
-var client = new Client(config);
+var client = new Client(dbConfig);
 // client.on('drain', client.end.bind(client)); //disconnect client when all queries are finished
 client.connect();
 
-var adjacencies = [],
+var rawAdjacencies = [],
+    rawStops = [],
+    rawRoutes = [],
     allGeos = {};
 
-var getAdjacenciesQuery = `SELECT id, route_ids from ${schema_name}.stop_adjacency ORDER BY id`;
+function getShapeID2Coords(cb) {
+    client.query(`SELECT shape_id, shape_pt_lat, shape_pt_lon, shape_pt_sequence FROM ${schema_name}.shapes;`, (err, result) => {
+        if(err) {
+            return cb(err);
+        }
+        let shapeIDs2Coords = {},
+            currPath,
+            prevPoint,
+            currPoint,
+            distTraveled,
+            seqNum,
+            lastSeqNum = Number.POSITIVE_INFINITY;
+        // console.log(result);
+        result.rows.forEach((row, i) => {
+            currPoint = turf.point([row.shape_pt_lon, row.shape_pt_lat]);
+            seqNum = row.shape_pt_sequence;
+            if(seqNum < lastSeqNum) {
+                shapeIDs2Coords[row.shape_id] = currPath = [];
+                distTraveled = 0;
+            }
+            else {
+                distTraveled += turf.distance(prevPoint, currPoint, "kilometers");
+            }
+            currPath.push({
+                latitude: row.shape_pt_lat,
+                longitude: row.shape_pt_lon,
+                dist_traveled: distTraveled
+            });
+            lastSeqNum = seqNum;
+            prevPoint = currPoint;
+        });
+        return cb(null, shapeIDs2Coords)
+    });
+}
+
+function getTripID2ShapeID(cb) {
+    client.query(`SELECT trip_id, shape_id FROM ${schema_name}.trips`, (err, result) => {
+        if(err) {
+            return cb(err);
+        }
+        let tripID2ShapeID = {};
+        result.rows.forEach((row, i) => {
+            if(row.shape_id) {
+                tripID2ShapeID[row.trip_id] = row.shape_id;
+            }
+        });
+        return cb(null, tripID2ShapeID);
+    });
+}
+
+function getTripID2StopIDs(cb) {
+    client.query(`SELECT trip_id, stop_id, stop_sequence FROM ${schema_name}.stop_times`, (err, result) => {
+        if(err) {
+            return cb(err);
+        }
+        let stopTimesMap = {},
+            currStopSeq,
+            seqNum;
+        // console.log(result.rows);
+        result.rows.forEach((row, i) => {
+            seqNum = row.stop_sequence;
+            // console.log(row);
+            if(seqNum === 1) {
+                stopTimesMap[row.trip_id] = currStopSeq = [];
+            }
+            currStopSeq.push(row.stop_id);
+        });
+        // console.log("stopTimesMap", stopTimesMap);
+        return cb(null, stopTimesMap);
+    });
+}
+
+function getStopIDToCoords(cb) {
+    client.query(`SELECT stop_id, stop_lat, stop_lon FROM ${schema_name}.stops`, (err, result) => {
+        if(err) {
+            return cb(err);
+        }
+        let stopCoordsMap = {};
+        result.rows.forEach((row, i) => {
+            stopCoordsMap[row.stop_id] = {
+                latitude: row.stop_lat,
+                longitude: row.stop_lon
+            };
+        });
+        return cb(null, stopCoordsMap);
+    });
+}
+
+function getGeoJSPointsForGTFSPoints(gtfsPoints) {
+    return gtfsPoints.map(function(pt) {
+        return turf.point([pt.longitude, pt.latitude]);
+    });
+}
+
+function getGeoJSLineSegmentsForGTFSPathWaypoints(waypointCoords) {
+    // start @ 2nd waypoint so that the index param to map points to previous waypoint
+    return waypointCoords.slice(1, waypointCoords.length).map((curr, index) => {
+        let prevCoords = [waypointCoords[index].longitude, waypointCoords[index].latitude],
+        currCoords = [curr.longitude, curr.latitude];
+
+        return turf.lineString([prevCoords, currCoords], {
+            start_dist_along: waypointCoords[index].dist_traveled
+        });
+    });
+}
+
+function getStopsProjectedToPathSegmentsTable(stop_ids, stopPoints, waypoints, pathSegments) {
+    return stopPoints.map(function(stopPt, stopNumber) {
+        return pathSegments.map(function(segment, i) {
+            let snapped = turf.pointOnLine(segment, stopPt),
+                snappedCoords = snapped.geometry.coordinates,
+                segmentStartPt = waypoints[i],
+                snappedDistTraveled = turf.distance(segmentStartPt, snapped, "kilometers") + segment.properties.start_dist_along,
+                deviation = turf.distance(stopPt, snapped, "kilometers");
+
+            return {
+                segmentNum: i,
+                stop_id: stop_ids[stopNumber],
+                stop_coords: stopPt.geometry.coordinates,
+                snapped_coords: snappedCoords,
+                snapped_dist_along_km: snappedDistTraveled,
+                deviation: deviation
+            };
+        });
+    });
+}
+
+function trySimpleMinification(table) {
+    var possibleOptimal = table.map(function (row) {
+        return _.first(_.sortByAll(row, ["deviation", "snapped_dist_along_km"]));
+    });
+    function invariantCheck (projectedPointA, projectedPointB) {
+        return (projectedPointA.snapped_dist_along_km <= projectedPointB.snapped_dist_along_km);
+    }
+
+    if (_.every(_.rest(possibleOptimal),
+                function (currPossOpt, i) {
+                    return invariantCheck(possibleOptimal[i], currPossOpt);
+                }))
+    {
+        return possibleOptimal;
+    } else {
+        return null;
+    }
+}
+// Finds the stops-to-path fitting with the minimum
+//      total squared distance between stops and their projection onto path line segments
+//      while maintaining the strong no-backtracking constraint.
+//
+// O(SW^2) where S is the number of stops, W is the number of waypointCoords in the path.
+//
+// NOTE: O(S W lg^2 W) is possible by using Willard's range trees on each row to find the optimal
+//       cell from the previous row from which to advance.
+/**
+ *
+ * @param {Array} Array of arrays. Rows = projections of stops onto each line segment of the path.
+ * @returns {Array|null} an array of the best possible projections for each stop.
+ */
+function fitStopsToPathUsingLeastSquares (theTable) {
+
+    var bestAssignmentOfSegments;
+
+    // Initialize the first row.
+    _.forEach(_.first(theTable), function (cell) {
+        cell.cost = (cell.deviation * cell.deviation);
+        cell.path = [cell.segmentNum];
+    });
+
+    // Do dynamic programing...
+    _.forEach(_.rest(theTable), function (stopRow, i) {
+        _.forEach(stopRow, function (thisCell) {
+
+            var bestFromPreviousRow = {
+                cost : Number.POSITIVE_INFINITY,
+            };
+
+            _.forEach(theTable[i], function (fromCell) {
+                if ((fromCell.snapped_dist_along_km <= thisCell.snapped_dist_along_km) &&
+                    (fromCell.cost < bestFromPreviousRow.cost)) {
+
+                    bestFromPreviousRow = fromCell;
+                }
+            });
+
+            thisCell.cost = bestFromPreviousRow.cost + (thisCell.deviation * thisCell.deviation);
+
+            if (thisCell.cost < Number.POSITIVE_INFINITY) {
+                thisCell.path = bestFromPreviousRow.path.slice(0); // This can be done once.
+                thisCell.path.push(thisCell.segmentNum);
+            } else {
+                thisCell.path = null;
+            }
+        });
+    });
+
+
+    // Did we find a path that works satisfies the constraint???
+    if ((bestAssignmentOfSegments = _.min(_.last(theTable), 'cost').path)) {
+
+        return bestAssignmentOfSegments.map(function (segmentNum, stopIndex) {
+            var bestProjection = theTable[stopIndex][segmentNum];
+
+            return {
+                segmentNum            : segmentNum                           ,
+                stop_id               : bestProjection.stop_id               ,
+                stop_coords           : bestProjection.stop_coords           ,
+                snapped_coords        : bestProjection.snapped_coords        ,
+                snapped_dist_along_km : bestProjection.snapped_dist_along_km ,
+                deviation             : bestProjection.deviation             ,
+            };
+        });
+
+    } else {
+        return null;
+    }
+}
+
+function fitStopsToPath(stop_ids, stopPointCoords, waypointCoords, tripID, shapeID) {
+    var stopPoints = getGeoJSPointsForGTFSPoints(stopPointCoords),
+        waypoints = getGeoJSPointsForGTFSPoints(waypointCoords),
+        pathSegments = getGeoJSLineSegmentsForGTFSPathWaypoints(waypointCoords),
+        table = getStopsProjectedToPathSegmentsTable(stop_ids, stopPoints, waypoints, pathSegments),
+
+        originStopID = null,
+        destinationStopID = null,
+
+        stopProjections,
+        metadata;
+
+    stopProjections = trySimpleMinification(table);
+    if(!stopProjections) {
+        stopProjections = fitStopsToPathUsingLeastSquares(table);
+    }
+    if(Array.isArray(stopProjections) && (stopProjections.length)) {
+        originStopID = stopProjections[0].stop_id;
+        destinationStopID = stopProjections[stopProjections.length - 1].stop_id;
+    }
+
+    metadata = {
+        __originStopID: originStopID,
+        __destinationStopID: destinationStopID,
+        __shapeID: shapeID
+    };
+
+    if(Array.isArray(stopProjections) && stopProjections.length) {
+        return stopProjections.reduce((acc, projection, i) => {
+            let prevStopProj = stopProjections[i - 1];
+            projection.previous_stop_id = prevStopProj ? prevStopProj.stop_id : null;
+            acc[projection.stop_id] = projection;
+            return acc;
+        }, metadata);
+    }
+    else {
+        return null;
+    }
+}
+
+function main(err, results) {
+    let theIndexedSpatialData,
+
+        projectionsMemoTable = [],
+        stopsAndPathsToMemoTableIndex = {},
+        tripKeyToMemoTableIndex = {};
+
+    if(err) {
+        console.error(err);
+        return;
+    }
+
+    Object.keys(results.tripID2ShapeID).forEach((tripID) => {
+        let shapeID = results.tripID2ShapeID[tripID];
+
+        let tripKey,
+            stop_ids = results.tripID2StopIDs[tripID],
+            waypointCoords = results.shapeID2Coords[shapeID],
+            stopPointCoords,
+            stopsToPathKey,
+            memoTableIndex,
+            stopProjections;
+
+        if(!waypointCoords) {
+            return; // if no shape
+        }
+        tripKey = tripID;
+
+        stopPointCoords = stop_ids.map(function(stopID) {
+            return results.stopID2Coords[stopID];
+        });
+
+        stopsToPathKey = shapeID + "|" + stop_ids.join("|");
+
+        memoTableIndex = stopsAndPathsToMemoTableIndex[stopsToPathKey];
+
+        if(memoTableIndex !== undefined) { // if these stops/shape have already been projected or nah
+            tripKeyToMemoTableIndex[tripKey] = memoTableIndex;
+            return;
+        }
+
+        stopProjections = fitStopsToPath(stop_ids, stopPointCoords, waypointCoords, tripID, shapeID);
+
+        tripKeyToMemoTableIndex[tripKey] = stopsAndPathsToMemoTableIndex[stopsToPathKey] = (stopProjections && projectionsMemoTable.length);
+
+        if(stopProjections) {
+            projectionsMemoTable.push(stopProjections);
+        }
+
+    });
+    theIndexedSpatialData = {
+        shapes: results.shapeID2Coords, // {"shape_id": [{pt, pt}, etc], etc }
+        stopProjectionsTable: projectionsMemoTable, // {}
+        tripKeyToProjectionsTableIndex: tripKeyToMemoTableIndex
+    };
+
+    async.parallel([ outputTheIndexedSpatialData.bind(null, theIndexedSpatialData), outputTheIndexingStatistics ], config.cb);
+
+}
+function outputTheIndexingStatistics(cb) {
+    // console.log("not outputting indexing stats");
+    return cb(null);
+}
+
+
+function outputTheIndexedSpatialData (theIndexedSpatialData, callback) {
+    // console.log('Writing the indexed GTFS spatial data to disk.') ;
+    // console.log(JSON.stringify(theIndexedSpatialData));
+    console.log(theIndexedSpatialData);
+    fs.writeFile(config.indexedSpatialDataFilePath, JSON.stringify(theIndexedSpatialData), function (err) {
+        if (err) {
+            console.error('Error writing the indexed GTFS spatial data to disk.') ;
+            return callback(err) ;
+        }
+        // console.log('Successfully wrote the indexed GTFS spatial data to disk.') ;
+        return callback(null) ;
+    });
+}
+
+var gtfsFileParsers = {
+    shapeID2Coords : getShapeID2Coords,
+    tripID2ShapeID : getTripID2ShapeID,
+    tripID2StopIDs : getTripID2StopIDs,
+    stopID2Coords  : getStopIDToCoords,
+};
+
+async.parallel(gtfsFileParsers, main);
+
+/*var getAdjacenciesQuery = `SELECT * from ${schema_name}.stop_adjacency ORDER BY id`;
 client.query(getAdjacenciesQuery, (err, result) => {
     if(err) {
         console.error(err);
         process.exit();
     }
 
-    console.log(result.rows[0].route_ids); // [ '289-142', '280-142', '286-142' ]
-    adjacencies = result.rows;
-    // console.log(adjacencies);
-    gatherGeos(adjacencies, function(){});
-});
+    // console.log(result.rows[0].route_ids); // [ '289-142', '280-142', '286-142' ]
+    rawAdjacencies = result.rows;
 
-var gatherGeos = function(data, cb) {
+});*/
+/*
+var formatAdjacenciesData = function(rawData) {
+    let data = {};
+
+    rawData.forEach((row, i) => {
+
+    });
+}*/
+
+// var getStopsQuery = `SELECT * from ${schema_name.name}.stops ORDER BY id`;
+
+
+/*var gatherGeos = function(data, cb) { // data is adjacencies
     data.forEach((val, i) => {
         let route_ids = val.route_ids,
             toMeshGeos = {},
@@ -63,15 +431,53 @@ var gatherGeos = function(data, cb) {
                 console.error(err);
                 process.exit();
             }
-            console.log(result);
-            let combinedGeos = {};
+            console.log(JSON.stringify(JSON.parse(result.rows[0].route_shape)));
+            // console.log(result);
+            let combinedGeos = {
+                "type": "FeatureCollection",
+                "features": []
+            };
             result.rows.forEach((routeGeo, rgi) => {
-
+                let feat = {
+                    type: "Feature",
+                    geometry: JSON.parse(routeGeo.route_shape),
+                    id: routeGeo.route_id
+                };
+                combinedGeos.features.push(feat);
             });
-            client.end(function (err) {
+            // console.log(combinedGeos);
+            let topology = topojson.topology({"routes": combinedGeos}, {"property-transform": (f) => {return f.properties}});
+            // console.log(topology.objects.routes.geometries);
+            // process.exit();
+            let newJson = {
+                "type": "FeatureCollection",
+                "features": [],
+                "bbox": topology.bbox,
+                "transform": topology.transform
+            };
+            topology.objects.routes.geometries.forEach((d) => {
+                let routeSwap = {
+                    "type": "GeometryCollection",
+                    "geometries": [d]
+                };
+                let mesh = topojson.mesh(topology, routeSwap, (a, b) => {return true;});
+                let feature = {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": mesh.type,
+                        "coordinates": mesh.coordinates
+                    }
+                }
+                newJson.features.push(feature);
+            });
+            console.log(JSON.stringify(newJson));
+            client.end(function(err) {
                 if (err) throw err;
             });
         });
+        // client.end(function(err) {
+        //     if (err) throw err;
+        // });
         /*route_ids.forEach((route_id) => {
             if(allGeos[route_id]) {
                 toMeshGeos[route_id] = allGeos[route_id];
@@ -85,14 +491,14 @@ var gatherGeos = function(data, cb) {
                     process.exit();
                 })
             }
-        });*/
+        });
     });
 
     cb();
 }
 
 
-/*
+
 pool.query(sql)
         .then(res => {
           res.rowCount === 0 ?
